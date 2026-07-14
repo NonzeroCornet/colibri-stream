@@ -316,10 +316,31 @@ path falls back to the CPU per-block on any fault. Numerics are dequant→f32-MA
 
 ### Experimental resident CUDA backend
 
-colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
-experts deliberately remain on the original CPU path for now: copying an expert
-from NVMe to the GPU on every use would only replace the disk bottleneck with a
-PCIe bottleneck. Resident quantized tensors are uploaded lazily once and reused.
+colibrì includes an opt-in CUDA backend for model-resident tensors. Resident
+quantized tensors are uploaded lazily once and reused. By default, streaming
+experts remain on the original CPU path — copying an expert from NVMe to the
+GPU synchronously on every use would only replace the disk bottleneck with a
+PCIe bottleneck. The **streaming expert tier** (`COLI_STREAM=1`, below) is the
+answer to exactly that objection: it hides the PCIe copy behind a tile-chunked,
+double-buffered pipeline instead of paying it synchronously.
+
+### Streaming GPU expert tier (`COLI_STREAM=1`)
+
+Treats VRAM as an **execution cache** over the SSD → RAM → VRAM hierarchy:
+non-resident experts are streamed into a pool of fixed-size VRAM slots as
+tile-chunked async DMA (`STREAM_TILE_KB`, default 512), with gate/up matmuls
+starting while the down projection is still on the bus, cache hits issued ahead
+of transfers, recency-primary eviction with frequency decay, and a
+low-priority prefetch lane fed by the router-lookahead pilot
+(`PILOT_REAL=1`). RAM-resident experts are submitted before disk misses so
+PCIe transfers overlap the preads (the same overlap the Metal backend gets).
+Measured on an RTX 5070 Ti (PCIe 5.0, Windows): **26.6 GB/s sustained cold
+streaming (~2,250 GLM-sized experts/s) and ~16,000 experts/s warm from the
+VRAM cache**; token-exact vs the oracle (TF 32/32, greedy 20/20). Every
+failure path falls back to the CPU expert path, never to a wrong answer.
+Composes with `PIPE=1`, MTP, `--topp`, and the resident tier — the measured
+hot set stays pinned, the streaming tier serves the tail. Details, knobs and
+benchmark: [docs/streaming-tier.md](docs/streaming-tier.md).
 
 ```bash
 cd c

@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <cstdlib>
 
+#ifdef _WIN32   /* MSVC has no POSIX setenv/unsetenv */
+static int setenv(const char *n, const char *v, int overwrite){ (void)overwrite; return _putenv_s(n, v); }
+static int unsetenv(const char *n){ return _putenv_s(n, ""); }
+#endif
+
 static int close_enough(const float *got, const float *want, int n) {
     for (int i = 0; i < n; i++) {
         if (std::fabs(got[i] - want[i]) > 1e-4f) {

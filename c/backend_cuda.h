@@ -73,6 +73,63 @@ COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 
+/* ---- Streaming expert tier (backend_stream.cu): VRAM as an execution cache.
+ * Experts are streamed on demand into a pool of fixed-size VRAM slots as
+ * tile-chunked async copies overlapped with compute (double-buffered across
+ * slots); slots are retained under a score-based LFRU policy so temporally
+ * local experts become cache hits. See docs/streaming-tier.md. ---- */
+
+/* Opaque in-flight demand group (one 64-expert MoE block submit). */
+typedef struct ColiCudaStreamHandle ColiCudaStreamHandle;
+
+/* Carve `vram_bytes` of `device` into slots of `slot_bytes` (one expert:
+ * gate+up+down weights and scales, 256B-aligned each). tile_kb sets the DMA
+ * chunk size (64..4096, the preemption granularity of the PCIe scheduler). */
+COLI_CUDA_DLLEXPORT int coli_cuda_stream_init(int device, size_t vram_bytes,
+                                              size_t slot_bytes, int tile_kb);
+COLI_CUDA_DLLEXPORT void coli_cuda_stream_shutdown(void);
+
+/* Pin host RAM (expert slabs) so streamed uploads are true async DMA.
+ * Failure is harmless: unpinned slabs still copy, just slower. */
+COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *ptr, size_t bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *ptr);
+
+/* Demand path, split-phase like the Metal block submit: begin() enqueues
+ * every transfer + kernel and returns immediately (the CPU overlaps disk
+ * reads / shared-expert work with the GPU pipeline); end() synchronizes and
+ * fills y[total_rows,D] (rows packed in call order). Weight pointers are the
+ * CPU container slabs (int4 offset-nibble / int2 / int8 / f32) and must stay
+ * valid until end() returns. accepted_mask bit j = expert j computed on GPU;
+ * rejected experts (slot too small, cache exhausted) stay on the CPU path.
+ * end() returning 0 means the WHOLE group must be recomputed on the CPU. */
+COLI_CUDA_DLLEXPORT ColiCudaStreamHandle *coli_cuda_stream_begin(
+        int layer, const int *eids, int count,
+        const void *const *gw, const void *const *uw, const void *const *dw,
+        const float *const *gs, const float *const *us, const float *const *ds,
+        const int *fg, const int *fu, const int *fd,
+        int D, int I, const float *x, const int *nrows, int total_rows,
+        uint64_t *accepted_mask);
+COLI_CUDA_DLLEXPORT int coli_cuda_stream_end(ColiCudaStreamHandle *handle, float *y);
+
+/* Residency probe: 1 if (layer,eid) is VRAM-resident now. The engine uses it
+ * to SKIP the disk read for cache-held experts (VRAM as a tier above RAM);
+ * a stale answer is safe — begin() rejects NULL-slab misses to the CPU path. */
+COLI_CUDA_DLLEXPORT int coli_cuda_stream_query(int layer, int eid);
+
+/* Speculative path (router-lookahead pilot): synchronous tiled upload on the
+ * low-priority copy stream, yielding to demand groups between tiles. Returns
+ * once the bytes are on the device — the caller's slab may be recycled
+ * immediately after. Returns 1 when the expert is (now) VRAM-resident. */
+COLI_CUDA_DLLEXPORT int coli_cuda_stream_put(int layer, int eid,
+        const void *gw, const void *uw, const void *dw,
+        const float *gs, const float *us, const float *ds,
+        int fg, int fu, int fd, int D, int I);
+
+/* st[0]=hits st[1]=misses st[2]=evictions st[3]=bytes_streamed st[4]=tiles
+ * st[5]=prefetch_puts st[6]=prefetch_hits st[7]=prefetch_drops st[8]=rejects
+ * st[9]=nslots st[10]=slot_bytes st[11]=reserved */
+COLI_CUDA_DLLEXPORT void coli_cuda_stream_stats(uint64_t st[12]);
+
 #ifdef __cplusplus
 }
 #endif

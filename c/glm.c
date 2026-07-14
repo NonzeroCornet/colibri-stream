@@ -125,7 +125,8 @@ typedef struct {
  * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
-                 int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
+                 int64_t slab_cap, fslab_cap; uint64_t used;
+                 int hpin; /* slab cudaHostRegister-ed for the STREAM tier's async DMA */ } ESlot;
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -180,6 +181,30 @@ static void usage_save(Model *m);        /* cache che impara: definita accanto a
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
+/* STREAM: streaming VRAM expert tier (backend_stream.cu) — VRAM as an
+ * execution cache fed by tile-chunked async DMA. COLI_STREAM=1 opts in. */
+static int g_stream;                       /* COLI_STREAM=1 (requires COLI_CUDA=1) */
+static int g_stream_tile_kb=512;           /* STREAM_TILE_KB: DMA chunk / preemption grain */
+static double g_stream_vram_gb;            /* STREAM_VRAM_GB: slot-pool budget (0 = auto) */
+static double g_stream_pin_gb=8.0;         /* STREAM_PIN_GB: host slab registration budget */
+static int64_t g_stream_pin_used;
+/* Pin an expert slab so its uploads are true async DMA; first-come budget so
+ * a RAM-sized LRU cannot lock tens of GB of non-pageable memory. Returns the
+ * hpin flag value. Unpin must only run on slabs this function pinned. */
+static int stream_host_pin(void *p,int64_t cap){
+    if(!g_stream||!p||cap<=0) return 0;
+    if(g_stream_pin_used+cap>(int64_t)(g_stream_pin_gb*1e9)) return 0;
+    if(!coli_cuda_host_register(p,(size_t)cap)) return 0;
+    g_stream_pin_used+=cap; return 1;
+}
+static void stream_host_unpin(void *p,int64_t cap){
+    if(!p||cap<=0) return;
+    coli_cuda_host_unregister(p);
+    g_stream_pin_used-=cap; if(g_stream_pin_used<0) g_stream_pin_used=0;
+}
+static const void *qt_wptr(const QT *t){   /* container weight view for the STREAM tier */
+    return t->fmt==0?(const void*)t->qf : t->fmt==1?(const void*)t->q8:(const void*)t->q4;
+}
 static int g_cuda_dense;
 static int g_cuda_release_host;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
@@ -208,6 +233,18 @@ static void cuda_stats_print(void){
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
         "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
+    if(g_stream){
+        uint64_t st[12]; coli_cuda_stream_stats(st);
+        uint64_t served=st[0]+st[1];
+        fprintf(stderr,"[STREAM] VRAM cache: %llu hit / %llu streamed (%.1f%% hit) | "
+            "%.2f GB in %llu tiles | %llu evictions | %llu rejects\n",
+            (unsigned long long)st[0],(unsigned long long)st[1],
+            served?100.0*(double)st[0]/(double)served:0.0,
+            (double)st[3]/1e9,(unsigned long long)st[4],
+            (unsigned long long)st[2],(unsigned long long)st[8]);
+        if(st[5]||st[7]) fprintf(stderr,"[STREAM] pilot prefetch: %llu uploads, %llu used before eviction, %llu dropped (cache busy)\n",
+            (unsigned long long)st[5],(unsigned long long)st[6],(unsigned long long)st[7]);
+    }
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
@@ -1266,9 +1303,17 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         s->slab_cap=need;
         if(g_metal_enabled) coli_metal_register(s->slab,need);
 #else
+#ifdef COLI_CUDA
+        if(s->hpin){ stream_host_unpin(s->slab,s->slab_cap); s->hpin=0; }
+#endif
         compat_aligned_free(s->slab);
         if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
         s->slab_cap=wtot+8192;
+#ifdef COLI_CUDA
+        /* STREAM tier: page-lock the slab so expert uploads are true async DMA
+         * (budgeted; an unpinned slab still streams via pageable copies). */
+        s->hpin=stream_host_pin(s->slab,s->slab_cap);
+#endif
 #endif
     }
     if(!s->fslab || ftot > s->fslab_cap){
@@ -1444,6 +1489,7 @@ static inline void pipe_wait(int q){
 #ifdef COLI_CUDA
 static void expert_host_release(Model *m, ESlot *s){
     if(!s->slab&&!s->fslab) return;
+    if(s->hpin){ stream_host_unpin(s->slab,s->slab_cap); s->hpin=0; }
 #if defined(__APPLE__) || defined(__linux__)
     if(s->slab) munlock(s->slab,(size_t)s->slab_cap);
     if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
@@ -1829,6 +1875,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
 #ifdef COLI_CUDA
+    int stream_go = g_stream && S<=64 && !omp_in_parallel();
     int group_enabled=S<=64;
     float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
     float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
@@ -1839,12 +1886,28 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
+#ifdef COLI_CUDA
+        int nvram=0;
+#endif
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
-            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
+            if(!use[j]){
+#ifdef COLI_CUDA
+                /* VRAM-residency probe: the execution cache is a tier ABOVE the
+                 * RAM LRU — an expert it holds needs NO disk read. qof=-2 marks
+                 * "no host bytes": the submit passes NULL slabs (the ws slot may
+                 * hold ANOTHER layer's stale weights — never trust it) and every
+                 * fallback reloads from disk before touching the slot. Top-down
+                 * ws slots stay disjoint from the miss slots (nmiss+nvram<=64). */
+                if(stream_go && coli_cuda_stream_query(layer,eid)){
+                    use[j]=&m->ws[63-nvram]; nvram++; qof[j]=-2; m->hits++; continue;
+                }
+#endif
+                qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
+            }
         }
         int metal_done=0;
 #ifdef COLI_METAL
@@ -1933,6 +1996,75 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         }
 #ifdef COLI_CUDA
         ESlot *group_e[64]; int group_n[64]; int ngroup=0;
+        /* ---- STREAM tier submit: non-resident experts become tile-streamed GPU
+         * work. Two phases mirror the Metal overlap: phase 0 (pin/LRU hits in
+         * RAM) is submitted BEFORE the disk misses are drained, so its PCIe
+         * transfers and kernels run while the I/O pool is still reading; phase
+         * 1 follows once every missed slab has landed. begin() only ENQUEUES:
+         * the CPU continues into the per-expert loop (rejected experts) and
+         * the resident-tier group while the GPU pipeline drains. */
+        ColiCudaStreamHandle *sth[2]={NULL,NULL}; uint64_t stmask[2]={0,0};
+        int stjl[2][64], stnrow[2][64], stn[2]={0,0};
+        int *strowbuf[2]={NULL,NULL}; float *strwbuf[2]={NULL,NULL};
+        float *stx[2]={NULL,NULL}, *sty[2]={NULL,NULL};
+        int stclaim[64]={0};
+        if(stream_go) for(int phase=0;phase<2;phase++){
+            int cand[64],nl=0;
+            for(int j=0;j<nb;j++){
+                ESlot *e=use[j];
+                if(e->g.cuda_eligible||e->u.cuda_eligible||e->d.cuda_eligible) continue;
+                if((phase==0)!=(qof[j]<0)) continue;    /* 0: RAM-resident, 1: disk miss */
+                cand[nl++]=j;
+            }
+            if(!nl) continue;
+            if(phase==1 && g_pipe && nmiss){            /* misses' slabs must be complete */
+                double tw=now_s();
+                for(int q=0;q<nmiss;q++) pipe_wait(q);
+                m->t_edisk += now_s()-tw;
+            }
+            const void *gwl[64],*uwl[64],*dwl[64]; const float *gsl[64],*usl[64],*dsl[64];
+            int fgl[64],ful[64],fdl[64],eidl[64];
+            strowbuf[phase]=malloc((size_t)64*S*sizeof(int));
+            strwbuf[phase]=malloc((size_t)64*S*sizeof(float));
+            stx[phase]=falloc((int64_t)S*K*D);
+            int tot=0,keep=0;
+            for(int a=0;a<nl;a++){
+                int j=cand[a], eid=uniq[base+j]; ESlot *e=use[j];
+                int nr=0;
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                    if(idxs[(int64_t)s*K+kk]==eid){
+                        strowbuf[phase][(size_t)keep*S+nr]=s;
+                        strwbuf[phase][(size_t)keep*S+nr]=ws[(int64_t)s*K+kk];
+                        memcpy(stx[phase]+(int64_t)(tot+nr)*D, x+(int64_t)s*D, D*sizeof(float));
+                        nr++; break;
+                    }
+                if(!nr) continue;
+                eidl[keep]=eid; stnrow[phase][keep]=nr; stjl[phase][keep]=j;
+                if(qof[j]==-2){
+                    /* VRAM-resident, no host bytes: NULL slabs make begin()
+                     * reject (instead of uploading stale ws data) if the slot
+                     * was evicted between the residency probe and now. */
+                    gwl[keep]=uwl[keep]=dwl[keep]=NULL;
+                    gsl[keep]=usl[keep]=dsl[keep]=NULL;
+                    fgl[keep]=ful[keep]=fdl[keep]=0;
+                } else {
+                    gwl[keep]=qt_wptr(&e->g); uwl[keep]=qt_wptr(&e->u); dwl[keep]=qt_wptr(&e->d);
+                    gsl[keep]=e->g.s; usl[keep]=e->u.s; dsl[keep]=e->d.s;
+                    fgl[keep]=e->g.fmt; ful[keep]=e->u.fmt; fdl[keep]=e->d.fmt;
+                }
+                tot+=nr; keep++;
+            }
+            stn[phase]=keep;
+            if(keep){
+                sty[phase]=falloc((int64_t)tot*D);
+                double t0=now_s();
+                sth[phase]=coli_cuda_stream_begin(layer,eidl,keep,gwl,uwl,dwl,gsl,usl,dsl,
+                    fgl,ful,fdl,D,I,stx[phase],stnrow[phase],tot,&stmask[phase]);
+                m->t_emm += now_s()-t0;
+                if(sth[phase]) for(int a=0;a<keep;a++)
+                    if(stmask[phase]>>a&1) stclaim[stjl[phase][a]]=1;
+            }
+        }
 #endif
 #ifdef COLI_METAL
         if(g_metal_enabled){
@@ -1974,6 +2106,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #ifdef COLI_METAL
             /* skip the subsets already computed on GPU */
             if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
+#endif
+#ifdef COLI_CUDA
+            if(stclaim[j]) continue;               /* claimed by the STREAM tier this block */
+            if(qof[j]==-2){                        /* probe said VRAM-resident but the slot was
+                                                    * evicted / begin failed: load from disk NOW
+                                                    * (never trust the stale ws slot contents) */
+                double t0=now_s(); expert_load(m,layer,eid,e,1); m->t_edisk+=now_s()-t0;
+            }
 #endif
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
@@ -2052,6 +2192,43 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             }
         }
         m->t_emm+=now_s()-tg;
+        /* ---- STREAM tier drain: synchronize the pipelined groups and fold their
+         * rows into out. Accepted experts were skipped by the CPU loop; a group
+         * whose end() fails is recomputed here on the CPU from the same slabs
+         * (still valid: ws[]/LRU recycling only happens after this point). ---- */
+        for(int phase=0;phase<2;phase++){
+            if(sth[phase]){
+                double t0=now_s();
+                int okend=coli_cuda_stream_end(sth[phase],sty[phase]);
+                int r0=0;
+                for(int a=0;a<stn[phase];a++){
+                    int j=stjl[phase][a], nr=stnrow[phase][a];
+                    if(okend && (stmask[phase]>>a&1)){
+                        for(int r=0;r<nr;r++){
+                            float *os=out+(int64_t)strowbuf[phase][(size_t)a*S+r]*D;
+                            float wgt=strwbuf[phase][(size_t)a*S+r];
+                            const float *hr=sty[phase]+(int64_t)(r0+r)*D;
+                            for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+                        }
+                    } else if(stclaim[j]){
+                        ESlot *e=use[j];
+                        if(qof[j]==-2) expert_load(m,layer,uniq[base+j],e,1); /* stale ws slot: reload */
+                        for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, stx[phase]+(int64_t)(r0+r)*D, D*sizeof(float));
+                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        matmul_qt(hh,gg,&e->d,nr);
+                        for(int r=0;r<nr;r++){
+                            float *os=out+(int64_t)strowbuf[phase][(size_t)a*S+r]*D;
+                            float wgt=strwbuf[phase][(size_t)a*S+r], *hr=hh+(int64_t)r*D;
+                            for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+                        }
+                    }
+                    r0+=nr;
+                }
+                m->t_emm += now_s()-t0;
+            }
+            free(stx[phase]); free(sty[phase]); free(strowbuf[phase]); free(strwbuf[phase]);
+        }
 #endif
         /* No drain barrier: the per-expert pipe_wait(qof[j]) above (issued for every
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
@@ -2148,6 +2325,19 @@ static void pilot_realload(Model *m, int layer, int eid){
     pthread_mutex_unlock(&g_pilot_mx);
 
     int rc=expert_load(m,layer,eid,dst,0);              /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server */
+
+#ifdef COLI_CUDA
+    /* STREAM tier: push the predicted expert into the VRAM cache NOW, while
+     * this thread still owns the slab exclusively (eid=-1, unpublished — the
+     * LRU cannot recycle it mid-DMA). stream_put is synchronous and rides the
+     * low-priority copy stream, yielding to demand groups between tiles: this
+     * is the "layer predictor" prefetch source feeding the PCIe queue. */
+    if(rc==0 && g_stream)
+        coli_cuda_stream_put(layer,eid,
+            qt_wptr(&dst->g),qt_wptr(&dst->u),qt_wptr(&dst->d),
+            dst->g.s,dst->u.s,dst->d.s,
+            dst->g.fmt,dst->u.fmt,dst->d.fmt,m->c.hidden,m->c.moe_inter);
+#endif
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
@@ -3648,6 +3838,31 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
 }
 
 int main(int argc, char **argv){
+    /* ---- ColiStream flags. Parsed FIRST and compacted out of argv so the
+     * positional cap/ebits/dbits indexing below is unchanged. Flags take
+     * precedence over the equivalent environment variables (COLI_STREAM,
+     * STREAM_VRAM_GB, STREAM_TILE_KB, STREAM_PIN_GB); --stream also implies
+     * the CUDA backend on device 0 unless COLI_GPU(S) says otherwise. ---- */
+    int flag_stream=-1, flag_tile=-1; double flag_vram=-1, flag_pin=-1;
+    {
+        int keep=1;
+        for(int i=1;i<argc;i++){
+            const char *arg=argv[i];
+            if(!strcmp(arg,"--stream")) flag_stream=1;
+            else if(!strcmp(arg,"--no-stream")) flag_stream=0;
+            else if(!strcmp(arg,"--stream-vram")&&i+1<argc) flag_vram=atof(argv[++i]);
+            else if(!strcmp(arg,"--stream-tile-kb")&&i+1<argc) flag_tile=atoi(argv[++i]);
+            else if(!strcmp(arg,"--stream-pin-gb")&&i+1<argc) flag_pin=atof(argv[++i]);
+            else if(!strncmp(arg,"--stream",8)){
+                fprintf(stderr,"unknown or valueless flag %s\n"
+                    "usage: [--stream|--no-stream] [--stream-vram GB] "
+                    "[--stream-tile-kb KB] [--stream-pin-gb GB] [cap [ebits [dbits]]]\n",arg);
+                return 2;
+            }
+            else argv[keep++]=argv[i];
+        }
+        argc=keep;
+    }
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
      * the worker team between regions and the re-wake latency dominates. Keeping
@@ -3735,7 +3950,7 @@ int main(int argc, char **argv){
         fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); return 2;
     }
 #ifdef COLI_CUDA
-    if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
+    if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) || flag_stream==1){
         const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
         if(one&&many){ fprintf(stderr,"use COLI_GPU or COLI_GPUS, not both\n"); return 2; }
         if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
@@ -3754,14 +3969,26 @@ int main(int argc, char **argv){
     if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
         g_cuda_release_host?"; VRAM experts without host backing":"");
+    /* flags first, environment as fallback (COLI_STREAM / STREAM_*) */
+    g_stream = flag_stream>=0 ? flag_stream
+             : getenv("COLI_STREAM")?atoi(getenv("COLI_STREAM")):0;
+    if(g_stream && !g_cuda_enabled){ fprintf(stderr,"--stream (COLI_STREAM) requires the CUDA backend (COLI_CUDA=1)\n"); return 2; }
+    g_stream_tile_kb = flag_tile>0 ? flag_tile
+             : getenv("STREAM_TILE_KB")?atoi(getenv("STREAM_TILE_KB")):512;
+    g_stream_vram_gb = flag_vram>=0 ? flag_vram
+             : getenv("STREAM_VRAM_GB")?atof(getenv("STREAM_VRAM_GB")):0;
+    g_stream_pin_gb  = flag_pin>=0 ? flag_pin
+             : getenv("STREAM_PIN_GB")?atof(getenv("STREAM_PIN_GB")):8.0;
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
        (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
-       (getenv("CUDA_EXPERT_GB") && atof(getenv("CUDA_EXPERT_GB"))>0)){
+       (getenv("CUDA_EXPERT_GB") && atof(getenv("CUDA_EXPERT_GB"))>0) ||
+       (getenv("COLI_STREAM") && atoi(getenv("COLI_STREAM"))) || flag_stream==1){
         fprintf(stderr,"CUDA was requested, but this binary is CPU-only; rebuild with: make CUDA=1\n");
         return 2;
     }
+    (void)flag_vram; (void)flag_tile; (void)flag_pin;
 #endif
 #ifdef COLI_METAL
     if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
@@ -3819,6 +4046,25 @@ int main(int argc, char **argv){
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
       cap_for_ram(&m, ram_env, ebits, est_ctx); }
+#ifdef COLI_CUDA
+    /* STREAM tier init: AFTER the resident VRAM tier (PIN/CUDA_EXPERT_GB) has
+     * claimed its experts, carve the remaining free VRAM into an expert slot
+     * pool. Slot = one streamable expert (weights + scales + alignment); the
+     * int8 MTP row is ~2x an int4 expert and is simply rejected to the CPU. */
+    if(g_stream){
+        int64_t sb = expert_bytes_probe(&m,m.ebits) + 6*256 + 4096;
+        size_t free_b=0,total_b=0;
+        if(!coli_cuda_mem_info(g_cuda_devices[0],&free_b,&total_b)) free_b=0;
+        double budget = g_stream_vram_gb>0 ? g_stream_vram_gb*1e9 : (double)free_b - 2e9;
+        if(budget > (double)free_b - 1e9) budget = (double)free_b - 1e9;
+        if(budget < 2.0*(double)sb ||
+           !coli_cuda_stream_init(g_cuda_devices[0],(size_t)budget,(size_t)sb,g_stream_tile_kb)){
+            fprintf(stderr,"[STREAM] tier unavailable (budget %.2f GB, slot %.1f MB): streamed experts stay on the CPU\n",
+                budget/1e9,(double)sb/1e6);
+            g_stream=0;
+        }
+    }
+#endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */

@@ -135,6 +135,13 @@ def env_for(a):
     if a.temp is not None: e["TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
     if a.repin: e["REPIN"]=str(a.repin)
     if a.ctx: e["CTX"]=str(a.ctx)
+    # ColiStream: streaming VRAM expert tier (flags mirror the engine's
+    # --stream family; --stream implies the CUDA backend on device 0)
+    if getattr(a,"stream",False):
+        e["COLI_STREAM"]="1"; e.setdefault("COLI_CUDA","1")
+    if getattr(a,"stream_vram",0): e["STREAM_VRAM_GB"]=str(a.stream_vram)
+    if getattr(a,"stream_tile_kb",0): e["STREAM_TILE_KB"]=str(a.stream_tile_kb)
+    if getattr(a,"stream_pin_gb",0): e["STREAM_PIN_GB"]=str(a.stream_pin_gb)
     if a.auto_tier:
         from resource_plan import build_plan, environment_for_plan, format_bytes
         if a.gpu is not None:
@@ -566,6 +573,11 @@ def main():
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
+    common.add_argument("--stream", action="store_true",
+                        help="ColiStream: streaming VRAM expert tier (requires a CUDA build)")
+    common.add_argument("--stream-vram", type=float, default=0, help="ColiStream VRAM slot-pool budget in GB (0=auto)")
+    common.add_argument("--stream-tile-kb", type=int, default=0, help="ColiStream DMA tile size in KB (default 512)")
+    common.add_argument("--stream-pin-gb", type=float, default=0, help="ColiStream host page-lock budget in GB (default 8)")
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])

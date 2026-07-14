@@ -51,6 +51,24 @@ typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const flo
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
+/* streaming expert tier (backend_stream.cu) */
+typedef int            (*fn_stream_init)(int device, size_t vram_bytes, size_t slot_bytes, int tile_kb);
+typedef void           (*fn_stream_shutdown)(void);
+typedef int            (*fn_host_register)(void *ptr, size_t bytes);
+typedef void           (*fn_host_unregister)(void *ptr);
+typedef ColiCudaStreamHandle *(*fn_stream_begin)(int layer, const int *eids, int count,
+                                const void *const *gw, const void *const *uw, const void *const *dw,
+                                const float *const *gs, const float *const *us, const float *const *ds,
+                                const int *fg, const int *fu, const int *fd,
+                                int D, int I, const float *x, const int *nrows, int total_rows,
+                                uint64_t *accepted_mask);
+typedef int            (*fn_stream_end)(ColiCudaStreamHandle *handle, float *y);
+typedef int            (*fn_stream_put)(int layer, int eid,
+                                const void *gw, const void *uw, const void *dw,
+                                const float *gs, const float *us, const float *ds,
+                                int fg, int fu, int fd, int D, int I);
+typedef int            (*fn_stream_query)(int layer, int eid);
+typedef void           (*fn_stream_stats)(uint64_t st[12]);
 
 /* Resolved pointers, plus a flag so we attempt the load at most once. */
 static struct {
@@ -72,6 +90,18 @@ static struct {
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_device   tensor_device;
+    /* streaming tier: resolved OPTIONALLY so an older coli_cuda.dll still
+     * provides the resident tier (stream_available gates the new calls). */
+    int stream_available;
+    fn_stream_init     stream_init;
+    fn_stream_shutdown stream_shutdown;
+    fn_host_register   host_register;
+    fn_host_unregister host_unregister;
+    fn_stream_begin    stream_begin;
+    fn_stream_end      stream_end;
+    fn_stream_put      stream_put;
+    fn_stream_query    stream_query;
+    fn_stream_stats    stream_stats;
 } g_cuda;
 
 /* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
@@ -120,6 +150,32 @@ static int coli_cuda_load(void){
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
     RESOLVE(tensor_device,  fn_tensor_device)
     #undef RESOLVE
+
+    /* Streaming-tier symbols are optional (older DLLs lack them): resolve all
+     * or none, and only disable the STREAM feature — never the whole backend. */
+    #define RESOLVE_OPT(name, type) \
+        _Pragma("GCC diagnostic push") \
+        _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"") \
+        g_cuda.name = (type)GetProcAddress(g_cuda.dll, "coli_cuda_" #name); \
+        _Pragma("GCC diagnostic pop") \
+        if(!g_cuda.name) stream_ok = 0;
+    {
+        int stream_ok = 1;
+        RESOLVE_OPT(stream_init,     fn_stream_init)
+        RESOLVE_OPT(stream_shutdown, fn_stream_shutdown)
+        RESOLVE_OPT(host_register,   fn_host_register)
+        RESOLVE_OPT(host_unregister, fn_host_unregister)
+        RESOLVE_OPT(stream_begin,    fn_stream_begin)
+        RESOLVE_OPT(stream_end,      fn_stream_end)
+        RESOLVE_OPT(stream_put,      fn_stream_put)
+        RESOLVE_OPT(stream_query,    fn_stream_query)
+        RESOLVE_OPT(stream_stats,    fn_stream_stats)
+        g_cuda.stream_available = stream_ok;
+        if(!stream_ok)
+            fprintf(stderr, "[CUDA] coli_cuda.dll predates the streaming tier; "
+                            "COLI_STREAM will be unavailable.\n");
+    }
+    #undef RESOLVE_OPT
 
     g_cuda.available = 1;
     return 1;
@@ -214,6 +270,66 @@ size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor){
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor){
     if(!g_cuda.available) return -1;
     return g_cuda.tensor_device(tensor);
+}
+
+/* ---- streaming tier wrappers: absent symbols degrade to "unavailable" ---- */
+
+int coli_cuda_stream_init(int device, size_t vram_bytes, size_t slot_bytes, int tile_kb){
+    if(!g_cuda.available || !g_cuda.stream_available) return 0;
+    return g_cuda.stream_init(device, vram_bytes, slot_bytes, tile_kb);
+}
+
+void coli_cuda_stream_shutdown(void){
+    if(g_cuda.available && g_cuda.stream_available) g_cuda.stream_shutdown();
+}
+
+int coli_cuda_host_register(void *ptr, size_t bytes){
+    if(!g_cuda.available || !g_cuda.stream_available) return 0;
+    return g_cuda.host_register(ptr, bytes);
+}
+
+void coli_cuda_host_unregister(void *ptr){
+    if(g_cuda.available && g_cuda.stream_available) g_cuda.host_unregister(ptr);
+}
+
+ColiCudaStreamHandle *coli_cuda_stream_begin(int layer, const int *eids, int count,
+        const void *const *gw, const void *const *uw, const void *const *dw,
+        const float *const *gs, const float *const *us, const float *const *ds,
+        const int *fg, const int *fu, const int *fd,
+        int D, int I, const float *x, const int *nrows, int total_rows,
+        uint64_t *accepted_mask){
+    if(!g_cuda.available || !g_cuda.stream_available){
+        if(accepted_mask) *accepted_mask = 0;
+        return NULL;
+    }
+    return g_cuda.stream_begin(layer, eids, count, gw, uw, dw, gs, us, ds,
+                               fg, fu, fd, D, I, x, nrows, total_rows, accepted_mask);
+}
+
+int coli_cuda_stream_end(ColiCudaStreamHandle *handle, float *y){
+    if(!g_cuda.available || !g_cuda.stream_available) return 0;
+    return g_cuda.stream_end(handle, y);
+}
+
+int coli_cuda_stream_put(int layer, int eid,
+        const void *gw, const void *uw, const void *dw,
+        const float *gs, const float *us, const float *ds,
+        int fg, int fu, int fd, int D, int I){
+    if(!g_cuda.available || !g_cuda.stream_available) return 0;
+    return g_cuda.stream_put(layer, eid, gw, uw, dw, gs, us, ds, fg, fu, fd, D, I);
+}
+
+int coli_cuda_stream_query(int layer, int eid){
+    if(!g_cuda.available || !g_cuda.stream_available) return 0;
+    return g_cuda.stream_query(layer, eid);
+}
+
+void coli_cuda_stream_stats(uint64_t st[12]){
+    if(!g_cuda.available || !g_cuda.stream_available){
+        if(st) for(int i = 0; i < 12; i++) st[i] = 0;
+        return;
+    }
+    g_cuda.stream_stats(st);
 }
 
 #endif /* _WIN32 */
